@@ -44,6 +44,17 @@ const (
 	// FormatText renders records with [slog.TextHandler] — a human-readable
 	// key=value format handy for local development.
 	FormatText Format = "text"
+	// FormatConsole renders records through the borealis themed console handler
+	// (level → comp.Glyph, attrs → comp.KV) for dev/CLI output. The themed sink
+	// lives in the gated logging-go/console leaf sub-package (Law 8); selecting
+	// it here without installing a console sink via [WithHandlerFunc] falls back
+	// to the text handler, so the zero-dep core stays buildable offline.
+	FormatConsole Format = "console"
+	// FormatDiscard sends records to [slog.DiscardHandler] (Go 1.24), the
+	// canonical no-op sink for tests and the disabled/unconfigured path. It
+	// drops every record with negligible overhead — the GSDS
+	// default-when-unconfigured handler (OBS-12).
+	FormatDiscard Format = "discard"
 )
 
 // DefaultLevelEnv is the environment variable consulted for the log level when
@@ -51,13 +62,24 @@ const (
 // convention of a single well-known level variable.
 const DefaultLevelEnv = "LOG_LEVEL"
 
+// SinkFunc builds the terminal (innermost) [slog.Handler] from the resolved
+// writer and handler options. It is the seam through which a gated sink — e.g.
+// the borealis console handler in logging-go/console — is injected into the
+// core's pipeline without the core importing it (Law 8). When it returns nil
+// the core falls back to its built-in sink for the configured format.
+type SinkFunc func(w io.Writer, opts *slog.HandlerOptions) slog.Handler
+
 // config is the resolved set of options used to build a logger. It is internal;
 // callers configure it exclusively through [Option] values passed to [New].
 type config struct {
-	level     slog.Level
-	writer    io.Writer
-	format    Format
-	addSource bool
+	level      slog.Level
+	levelVar   *slog.LevelVar
+	writer     io.Writer
+	format     Format
+	addSource  bool
+	middleware []Middleware
+	extractors []FieldExtractor
+	sink       SinkFunc
 }
 
 // Option configures [New] using the functional-options pattern, matching the
@@ -110,6 +132,10 @@ func WithFormat(format string) Option {
 			c.format = FormatJSON
 		case FormatText:
 			c.format = FormatText
+		case FormatConsole:
+			c.format = FormatConsole
+		case FormatDiscard:
+			c.format = FormatDiscard
 		}
 	}
 }
@@ -119,6 +145,76 @@ func WithFormat(format string) Option {
 // tracing's source spans. Off by default.
 func WithAddSource(add bool) Option {
 	return func(c *config) { c.addSource = add }
+}
+
+// WithLevelVar installs an externally-owned [*slog.LevelVar] as the logger's
+// level source, enabling live verbosity changes after construction — the zap
+// AtomicLevel pattern, and the mechanism by which a shikumi config reload can
+// retarget verbosity without rebuilding the logger. The caller retains the
+// LevelVar and calls its Set method (or [SetLevel] on the logger returned by
+// [New]) to change the level at runtime. A nil var is ignored.
+//
+// When no LevelVar is supplied, [New] allocates one internally seeded from the
+// resolved static level, so [SetLevel]/[LevelVarOf] always work; pass your own
+// only when you need to share it across several loggers.
+func WithLevelVar(v *slog.LevelVar) Option {
+	return func(c *config) {
+		if v != nil {
+			c.levelVar = v
+		}
+	}
+}
+
+// WithMiddleware appends [Middleware] decorators to the handler pipeline. Each
+// is a `func(slog.Handler) slog.Handler`; they are applied in the canonical
+// order redact → inject → sample → sink, with the supplied middlewares wrapping
+// the built-in [ContextHandler] inject stage (so they see records before
+// context fields are injected — the right place for redaction). Middlewares
+// from samber/slog-multi, slog-sampling, and slog-formatter compose here
+// unchanged. nil middlewares are skipped. Repeated calls accumulate.
+func WithMiddleware(mw ...Middleware) Option {
+	return func(c *config) {
+		for _, m := range mw {
+			if m != nil {
+				c.middleware = append(c.middleware, m)
+			}
+		}
+	}
+}
+
+// WithExtractors sets the [FieldExtractor] registry the [ContextHandler] runs to
+// inject top-level fields from context. Passing extractors here REPLACES the
+// built-in correlation_id + tenant set, so include [CorrelationIDExtractor] and
+// [TenantExtractor] explicitly to keep them. With no call, the built-in set is
+// used. Repeated calls accumulate onto the explicit set.
+func WithExtractors(extractors ...FieldExtractor) Option {
+	return func(c *config) {
+		for _, ex := range extractors {
+			if ex != nil {
+				c.extractors = append(c.extractors, ex)
+			}
+		}
+	}
+}
+
+// WithSink injects a terminal [SinkFunc] used to build the innermost handler,
+// overriding the format-derived built-in sink. It is how the gated borealis
+// console sink (logging-go/console) is wired in without the core importing it
+// (Law 8): logging-go/console exposes a [SinkFunc] that callers pass here. A nil
+// sink, or a sink that returns nil, falls back to the format-derived built-in.
+func WithSink(sink SinkFunc) Option {
+	return func(c *config) {
+		if sink != nil {
+			c.sink = sink
+		}
+	}
+}
+
+// WithDiscard routes output to [slog.DiscardHandler], the no-op sink for tests
+// and the disabled path. Equivalent to selecting [FormatDiscard]. It overrides
+// any format and writer.
+func WithDiscard() Option {
+	return func(c *config) { c.format = FormatDiscard }
 }
 
 // New builds a [*slog.Logger] from the given options.
@@ -144,18 +240,60 @@ func New(opts ...Option) *slog.Logger {
 		}
 	}
 
+	// The level source is always a *slog.LevelVar so the level can be retargeted
+	// live (the zap.AtomicLevel pattern). Use a caller-supplied var when given,
+	// else seed an internal one from the resolved static level.
+	lv := cfg.levelVar
+	if lv == nil {
+		lv = new(slog.LevelVar)
+		lv.Set(cfg.level)
+	}
+
 	handlerOpts := &slog.HandlerOptions{
-		Level:     cfg.level,
+		Level:     lv,
 		AddSource: cfg.addSource,
 	}
 
-	var base slog.Handler
-	switch cfg.format {
-	case FormatText:
-		base = slog.NewTextHandler(cfg.writer, handlerOpts)
-	default:
-		base = slog.NewJSONHandler(cfg.writer, handlerOpts)
+	// Build the terminal sink: a gated SinkFunc (e.g. the borealis console)
+	// wins; otherwise the format selects a built-in stdlib handler.
+	var sink slog.Handler
+	if cfg.sink != nil {
+		sink = cfg.sink(cfg.writer, handlerOpts)
+	}
+	if sink == nil {
+		sink = builtinSink(cfg.format, cfg.writer, handlerOpts)
 	}
 
-	return slog.New(NewContextHandler(base))
+	// inject stage: context-field injection via the (possibly customized)
+	// extractor registry. This is the always-present middleware of the chain.
+	// It also carries the live level var so [LevelVarOf]/[SetLevel] can recover
+	// it from the returned logger.
+	inject := func(h slog.Handler) slog.Handler {
+		ch := NewContextHandler(h)
+		if len(cfg.extractors) != 0 {
+			ch = NewContextHandlerWithExtractors(h, cfg.extractors...)
+		}
+		ch.levelVar = lv
+		return ch
+	}
+
+	// Canonical order: caller middleware (e.g. redact) wraps inject wraps sink.
+	// Pipe applies first-listed-outermost, so [middleware…, inject] yields
+	// middleware → inject → sink.
+	chain := append(append([]Middleware{}, cfg.middleware...), inject)
+	return slog.New(Pipe(sink, chain...))
+}
+
+// builtinSink returns the stdlib handler for a format. FormatConsole without an
+// installed console SinkFunc degrades to text so the zero-dep core stays
+// buildable offline; FormatDiscard uses the no-op sink.
+func builtinSink(format Format, w io.Writer, opts *slog.HandlerOptions) slog.Handler {
+	switch format {
+	case FormatText, FormatConsole:
+		return slog.NewTextHandler(w, opts)
+	case FormatDiscard:
+		return slog.DiscardHandler
+	default:
+		return slog.NewJSONHandler(w, opts)
+	}
 }

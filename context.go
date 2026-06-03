@@ -96,6 +96,17 @@ type ContextHandler struct {
 	// fields) so call-site attributes still land inside their group while the
 	// injected fields stay at the top level. nil until the first group opens.
 	ops []handlerOp
+	// extractors is the registry of context→attrs functions run on every
+	// record (in order) to produce the injected top-level fields. nil means
+	// the built-in correlation_id + tenant extractors ([defaultExtractors]).
+	// It is shared by-reference across derived handlers (WithAttrs/WithGroup):
+	// the registry is fixed at construction and never mutated, only read.
+	extractors []FieldExtractor
+	// levelVar is the live level source [New] installed, surfaced here so
+	// [LevelVarOf] / [SetLevel] can recover it by walking the handler chain.
+	// nil when the handler was built directly (not via New). Carried unchanged
+	// across derived handlers.
+	levelVar *slog.LevelVar
 }
 
 // handlerOp is a single recorded WithAttrs or WithGroup application, replayed in
@@ -107,9 +118,29 @@ type handlerOp struct {
 
 // NewContextHandler wraps inner so that context-carried fields are injected into
 // every record. The returned handler delegates level filtering, attribute
-// grouping, and formatting to inner.
+// grouping, and formatting to inner. It uses the built-in extractor registry
+// (correlation_id + tenant); use [NewContextHandlerWithExtractors] to inject a
+// custom set of [FieldExtractor]s.
 func NewContextHandler(inner slog.Handler) *ContextHandler {
 	return &ContextHandler{inner: inner, root: inner}
+}
+
+// NewContextHandlerWithExtractors wraps inner with an explicit registry of
+// [FieldExtractor]s run (in order) to produce the injected top-level fields.
+// Passing no extractors falls back to the built-in correlation_id + tenant set,
+// matching [NewContextHandler]. Pass [CorrelationIDExtractor]/[TenantExtractor]
+// explicitly to keep them alongside a custom extractor; omit them to drop them.
+func NewContextHandlerWithExtractors(inner slog.Handler, extractors ...FieldExtractor) *ContextHandler {
+	return &ContextHandler{inner: inner, root: inner, extractors: extractors}
+}
+
+// resolveExtractors returns the active registry, falling back to the built-in
+// set when none was configured.
+func (h *ContextHandler) resolveExtractors() []FieldExtractor {
+	if h.extractors == nil {
+		return defaultExtractors()
+	}
+	return h.extractors
 }
 
 // Enabled reports whether the wrapped handler emits records at the given level.
@@ -126,7 +157,7 @@ func (h *ContextHandler) Enabled(ctx context.Context, level slog.Level) bool {
 // recorded group/attr operations are replayed on top, so the injected fields
 // stay at the top level while call-site attributes remain inside their group.
 func (h *ContextHandler) Handle(ctx context.Context, record slog.Record) error {
-	attrs := contextAttrs(ctx)
+	attrs := runExtractors(h.resolveExtractors(), ctx)
 	if len(attrs) == 0 {
 		return h.inner.Handle(ctx, record)
 	}
@@ -148,19 +179,6 @@ func (h *ContextHandler) Handle(ctx context.Context, record slog.Record) error {
 	return handler.Handle(ctx, record)
 }
 
-// contextAttrs collects the context-carried fields present in ctx as a slice of
-// [slog.Attr], in a stable order (correlation ID then tenant).
-func contextAttrs(ctx context.Context) []slog.Attr {
-	var attrs []slog.Attr
-	if id, ok := CorrelationIDFromContext(ctx); ok {
-		attrs = append(attrs, slog.String(CorrelationIDKey, id))
-	}
-	if tenant, ok := TenantFromContext(ctx); ok {
-		attrs = append(attrs, slog.String(TenantKey, tenant))
-	}
-	return attrs
-}
-
 // WithAttrs returns a new [ContextHandler] whose wrapped handler carries the
 // given attributes, preserving the context-injection behaviour. Attributes
 // added before any group stay top-level; attributes added after a group is open
@@ -169,7 +187,7 @@ func (h *ContextHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	if len(attrs) == 0 {
 		return h
 	}
-	next := &ContextHandler{inner: h.inner.WithAttrs(attrs), root: h.root}
+	next := &ContextHandler{inner: h.inner.WithAttrs(attrs), root: h.root, extractors: h.extractors, levelVar: h.levelVar}
 	if len(h.ops) == 0 {
 		// Still ungrouped: advance root in lockstep so these attributes remain
 		// top-level for injected fields too.
@@ -189,9 +207,11 @@ func (h *ContextHandler) WithGroup(name string) slog.Handler {
 		return h
 	}
 	return &ContextHandler{
-		inner: h.inner.WithGroup(name),
-		root:  h.root,
-		ops:   appendOp(h.ops, handlerOp{group: name}),
+		inner:      h.inner.WithGroup(name),
+		root:       h.root,
+		ops:        appendOp(h.ops, handlerOp{group: name}),
+		extractors: h.extractors,
+		levelVar:   h.levelVar,
 	}
 }
 

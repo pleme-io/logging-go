@@ -6,8 +6,10 @@ counterpart to the Rust [`tracing`](https://docs.rs/tracing) +
 `pleme-actions-shared::log`: the same model, so every Go service and tool
 emits logs the same way.
 
-> **Pure standard library.** Built entirely on [`log/slog`](https://pkg.go.dev/log/slog).
+> **Pure standard library core.** Built entirely on [`log/slog`](https://pkg.go.dev/log/slog).
 > Zero external dependencies — offline-buildable with a minimal closure.
+> Dep-bearing features (borealis console, declarative redaction) live in
+> quarantined leaf sub-modules (`console/`, `redact/`) so the core stays clean.
 
 ## What & why
 
@@ -30,14 +32,37 @@ gives every Go program one logger shape:
 | `WithLevel(slog.Level)` | Set the minimum level explicitly. |
 | `WithLevelFromEnv(name string)` | Read the level from an env var (default `LOG_LEVEL`). |
 | `WithWriter(io.Writer)` | Redirect output (default stdout). |
-| `WithFormat("json"\|"text")` | Choose the handler. |
+| `WithFormat("json"\|"text"\|"console"\|"discard")` | Choose the sink. |
 | `WithAddSource(bool)` | Annotate records with source location. |
+| `WithDiscard()` | Route to `slog.DiscardHandler` (no-op sink for tests/disabled). |
+| `Config` + `FromConfig(cfg, opts…) (*slog.Logger, error)` | Typed yaml config → logger (§3.5 canonical config consumer; never calls `shikumi.Load`). |
+| `Middleware = func(slog.Handler) slog.Handler` + `WithMiddleware(…)` + `Pipe(sink, …)` | Decorator pipeline (Law 2): `redact → inject → sample → sink`. |
+| `FieldExtractor` + `WithExtractors(…)` | Pluggable ctx→attrs registry; `CorrelationIDExtractor`/`TenantExtractor` are the built-ins. |
+| `WithLevelVar(*slog.LevelVar)` / `SetLevel(logger, lvl)` / `LevelVarOf(logger)` | Live, dynamic verbosity (zap.AtomicLevel pattern). |
+| `SecretString` + `Redacted` | `slog.LogValuer` that redacts a secret in every render path. |
+| `WithSink(SinkFunc)` | Inject a gated terminal sink (e.g. the borealis console) without the core importing it (Law 8). |
 | `WithCorrelationID(ctx, id)` | Carry a correlation ID on the context. |
 | `WithTenant(ctx, tenant)` | Carry a tenant on the context. |
-| `ContextHandler` | `slog.Handler` wrapper that injects the ctx fields. |
+| `ContextHandler` | `slog.Handler` wrapper that injects the ctx fields (group-aware). |
 | `FromContext(ctx) *slog.Logger` | Logger from ctx, falling back to the default. |
 | `Default()` / `SetDefault(*slog.Logger)` | The package-level logger. |
 | `ParseLevel(name) (slog.Level, error)` | Parse a level name. |
+
+### Leaf sub-modules (gated deps)
+
+| Module | Dep | Purpose |
+| --- | --- | --- |
+| `logging-go/console` | `pleme-io/borealis` | Themed dev/CLI console sink — `console.Sink(theme)` → a `logging.SinkFunc`, wired via `logging.WithSink`. Level glyph + `comp.KV` attrs. |
+| `logging-go/redact` | `samber/slog-formatter` | Declarative key-based redaction `Middleware` — `redact.Keys(…)`, `redact.PII(…)`, `redact.FormatKey(…)`. |
+
+```go
+// Typed config + gated console + declarative redaction, composed:
+log, _ := logging.FromConfig(cfg.Logging,
+	logging.WithSink(console.Sink(theme.Default())),     // gated borealis console
+	logging.WithMiddleware(redact.Keys("token", "password")), // gated redaction
+)
+logging.SetLevel(log, slog.LevelDebug) // live verbosity change
+```
 
 ## Usage
 
