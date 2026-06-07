@@ -1,3 +1,5 @@
+github.com/pleme-io/logging-go v0.1.0 h1:BDkfaBCTdI1LH/TGhLc7nx1gDh86AVrPnBW1R2tw2rA=
+github.com/pleme-io/logging-go v0.1.0/go.mod h1:uQe9esFRFAtagiafZiuvNOgjTMgvAytVwCQsvPd3ldc=
 github.com/samber/lo v1.53.0 h1:t975lj2py4kJPQ6haz1QMgtId2gtmfktACxIXArw3HM=
 github.com/samber/lo v1.53.0/go.mod h1:4+MXEGsJzbKGaUEQFKBq2xtfuznW9oz/WrgyzMzRoM0=
 github.com/samber/slog-common v0.21.0 h1:Wo2hTly1Br5RjYqX/BTWJJeDnTE85oWk/7vqlpZuAUc=
